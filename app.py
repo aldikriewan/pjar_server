@@ -12,8 +12,12 @@ import threading
 from pathlib import Path
 from email.message import EmailMessage
 import smtplib
+from dotenv import load_dotenv
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
+import mimetypes
+
+load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-pjar")
@@ -23,13 +27,23 @@ DB_PATH = os.environ.get("DATABASE_PATH", Path(__file__).parent / "users.db")
 UPLOAD_DIR = os.environ.get("UPLOAD_FOLDER", Path(__file__).parent / "uploads" / "received")
 Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
-# SMTP Config (dari environment variables)
+# Folder berisi file video yang bisa ditonton client
+VIDEO_DIR = Path(os.environ.get("VIDEO_DIR", Path(__file__).parent / "videos"))
+VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+VIDEO_EXTENSIONS = (".mp4", ".webm", ".ogg", ".mkv", ".mov")
+
+# SMTP Config (dari environment variables / .env)
 SMTP_CONFIG = {
     "MAIL_USERNAME": os.environ.get("MAIL_USERNAME", ""),
     "MAIL_PASSWORD": os.environ.get("MAIL_PASSWORD", ""),
     "MAIL_SERVER": os.environ.get("MAIL_SERVER", "smtp.gmail.com"),
     "MAIL_PORT": os.environ.get("MAIL_PORT", 465),
 }
+
+# Penyimpanan kode verifikasi di sisi server (keyed by username).
+# Kode TIDAK dikembalikan ke client; hanya dikirim via email.
+PENDING_CODES = {}
+PENDING_LOCK = threading.Lock()
 
 SERVER_STARTED = False
 
@@ -68,11 +82,12 @@ init_db()
 
 
 def send_verification_email(recipient: str, code: str) -> bool:
-    smtp_user = SMTP_CONFIG.get("MAIL_USERNAME", "")
-    smtp_pass = SMTP_CONFIG.get("MAIL_PASSWORD", "")
+    smtp_user = SMTP_CONFIG.get("MAIL_USERNAME", "").strip()
+    # App password Gmail kadang ditulis dengan spasi; hapus agar valid.
+    smtp_pass = SMTP_CONFIG.get("MAIL_PASSWORD", "").replace(" ", "")
     if not smtp_user or not smtp_pass:
-        print(f"[MAIL] Kode verifikasi untuk {recipient}: {code}")
-        return True
+        print(f"[MAIL] (SMTP tidak dikonfigurasi) Kode verifikasi untuk {recipient}: {code}")
+        return False
 
     msg = EmailMessage()
     msg["Subject"] = "Kode verifikasi aplikasi PJAR"
@@ -81,25 +96,37 @@ def send_verification_email(recipient: str, code: str) -> bool:
     msg.set_content(f"Halo,\n\nKode verifikasi Anda adalah: {code}\n\nGunakan kode ini untuk masuk ke aplikasi.")
 
     try:
-        with smtplib.SMTP_SSL(SMTP_CONFIG.get("MAIL_SERVER", "smtp.gmail.com"), 
+        with smtplib.SMTP_SSL(SMTP_CONFIG.get("MAIL_SERVER", "smtp.gmail.com"),
                              int(SMTP_CONFIG.get("MAIL_PORT", 465))) as smtp:
             smtp.login(smtp_user, smtp_pass)
             smtp.send_message(msg)
+        print(f"[MAIL] Kode verifikasi berhasil dikirim ke {recipient}")
         return True
     except Exception as e:
-        print(f"[MAIL] Error: {e}")
+        print(f"[MAIL] Error mengirim email ke {recipient}: {e}")
         return False
 
 
 # ============= TCP Upload Server =============
+def recv_line(conn):
+    """Baca byte demi byte sampai menemukan newline (akhir header)."""
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = conn.recv(1)
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
 def tcp_upload_handler(conn, addr):
     print(f"[TCP] Client connected: {addr}")
     try:
-        data = conn.recv(4096).decode("utf-8", errors="ignore")
-        if not data:
+        header = recv_line(conn).decode("utf-8", errors="ignore").strip()
+        if not header:
             conn.sendall(b"NO_DATA")
             return
-        filename, filesize = data.strip().split(":", 1)
+        filename, filesize = header.split(":", 1)
         filesize = int(filesize)
         target_path = Path(UPLOAD_DIR) / filename
         received = 0
@@ -207,12 +234,14 @@ def login():
     conn.close()
 
     if user and user["password"] == password:
-        code = "000000"  # Demo: fixed code
+        code = f"{random.randint(100000, 999999)}"
+        with PENDING_LOCK:
+            PENDING_CODES[username] = code
+        send_verification_email(user["email"], code)
         return jsonify({
-            "message": "Login berhasil",
+            "message": "Login berhasil. Kode verifikasi telah dikirim ke email Anda.",
             "username": username,
-            "email": user["email"],
-            "code": code
+            "email": user["email"]
         }), 200
 
     return jsonify({"error": "Username atau password salah"}), 401
@@ -221,12 +250,17 @@ def login():
 @app.route("/api/verify", methods=["POST"])
 def verify():
     data = request.get_json()
+    username = data.get("username", "").strip()
     code = data.get("code", "").strip()
-    expected_code = data.get("expected_code", "").strip()
 
-    if code == expected_code:
-        return jsonify({"message": "Verifikasi berhasil"}), 200
-    
+    with PENDING_LOCK:
+        expected = PENDING_CODES.get(username)
+        if expected is None:
+            return jsonify({"error": "Belum ada kode verifikasi. Lakukan login terlebih dahulu."}), 400
+        if code == expected:
+            PENDING_CODES.pop(username, None)
+            return jsonify({"message": "Verifikasi berhasil"}), 200
+
     return jsonify({"error": "Kode verifikasi salah"}), 401
 
 
@@ -266,6 +300,25 @@ def stream_video():
         return jsonify({"message": "Streaming dimulai", "status": status}), 200
     except OSError as exc:
         return jsonify({"error": f"Streaming gagal: {exc}"}), 500
+
+
+@app.route("/api/videos", methods=["GET"])
+def list_videos():
+    videos = []
+    for p in sorted(VIDEO_DIR.iterdir()):
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
+            videos.append({"name": p.name, "size": p.stat().st_size})
+    return jsonify({"videos": videos})
+
+
+@app.route("/videos/<path:filename>")
+def serve_video(filename):
+    target = (VIDEO_DIR / filename).resolve()
+    if not str(target).startswith(str(VIDEO_DIR.resolve())) or not target.is_file():
+        return jsonify({"error": "Video tidak ditemukan"}), 404
+    mimetype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    # conditional=True membuat Flask mendukung Range request (seek di player)
+    return send_file(target, mimetype=mimetype, conditional=True)
 
 
 if __name__ == "__main__":
