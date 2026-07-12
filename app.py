@@ -14,13 +14,30 @@ from email.message import EmailMessage
 import smtplib
 from dotenv import load_dotenv
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, make_response
 import mimetypes
 
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-pjar")
+
+# CORS - agar frontend (Vercel/Cloudflare) bisa memanggil API langsung dari browser
+CORS_ORIGIN = os.environ.get("CORS_ORIGIN", "*")
+
+
+@app.after_request
+def _add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = CORS_ORIGIN
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return resp
+
+
+@app.before_request
+def _handle_preflight():
+    if request.method == "OPTIONS":
+        return make_response("", 204)
 
 # Configuration
 DB_PATH = os.environ.get("DATABASE_PATH", Path(__file__).parent / "users.db")
